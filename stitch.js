@@ -492,10 +492,17 @@ async function run() {
   const durations = [];
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
-    const pct = Math.round(((i + 1) / files.length) * 100);
+    const name = path.basename(f);
+    if (process.stderr.isTTY) {
+      process.stderr.write(`    0% [${i + 1}/${files.length}] ${name}...`);
+    }
     const dur = getDuration(f);
     durations.push(dur);
-    console.error(`  Probing ${String(pct).padStart(3)}% [${i + 1}/${files.length}] ${path.basename(f)} → ${formatTime(dur)} (${dur.toFixed(2)}s)`);
+    if (process.stderr.isTTY) {
+      process.stderr.clearLine(0);
+      process.stderr.cursorTo(0);
+    }
+    console.error(`  100% [${i + 1}/${files.length}] ${name} → ${formatTime(dur)} (${dur.toFixed(2)}s)`);
   }
   const totalDuration = durations.reduce((a, b) => a + b, 0);
   console.error(`Total duration: ${formatTime(totalDuration)}`);
