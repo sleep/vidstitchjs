@@ -485,17 +485,26 @@ async function run() {
   console.error(`Found ${files.length} video file(s). Probing files...`);
 
   // Get target resolution from first file
-  console.error(`  Probing [1/${files.length}] ${path.basename(files[0])} (resolution)...`);
   const { width, height, fps } = getVideoInfo(files[0]);
   console.error(`  Target: ${width}x${height} @ ${fps.toFixed(2)} fps`);
 
   // Get durations for all files
-  const durations = files.map((f, i) => {
-    console.error(`  Probing [${i + 1}/${files.length}] ${path.basename(f)}...`);
+  const durations = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const pct = Math.round(((i + 1) / files.length) * 100);
     const dur = getDuration(f);
-    console.error(`    → ${formatTime(dur)} (${dur.toFixed(2)}s)`);
-    return dur;
-  });
+    durations.push(dur);
+    const line = `  Probing ${String(pct).padStart(3)}% [${i + 1}/${files.length}] ${path.basename(f)} → ${formatTime(dur)} (${dur.toFixed(2)}s)`;
+    if (process.stderr.isTTY) {
+      process.stderr.clearLine(0);
+      process.stderr.cursorTo(0);
+      process.stderr.write(line);
+    } else {
+      console.error(line);
+    }
+  }
+  if (process.stderr.isTTY) process.stderr.write("\n");
   const totalDuration = durations.reduce((a, b) => a + b, 0);
   console.error(`Total duration: ${formatTime(totalDuration)}`);
 
