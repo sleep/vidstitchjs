@@ -495,16 +495,8 @@ async function run() {
     const pct = Math.round(((i + 1) / files.length) * 100);
     const dur = getDuration(f);
     durations.push(dur);
-    const line = `  Probing ${String(pct).padStart(3)}% [${i + 1}/${files.length}] ${path.basename(f)} → ${formatTime(dur)} (${dur.toFixed(2)}s)`;
-    if (process.stderr.isTTY) {
-      process.stderr.clearLine(0);
-      process.stderr.cursorTo(0);
-      process.stderr.write(line);
-    } else {
-      console.error(line);
-    }
+    console.error(`  Probing ${String(pct).padStart(3)}% [${i + 1}/${files.length}] ${path.basename(f)} → ${formatTime(dur)} (${dur.toFixed(2)}s)`);
   }
-  if (process.stderr.isTTY) process.stderr.write("\n");
   const totalDuration = durations.reduce((a, b) => a + b, 0);
   console.error(`Total duration: ${formatTime(totalDuration)}`);
 
