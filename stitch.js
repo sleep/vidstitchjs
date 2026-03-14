@@ -21,11 +21,38 @@ const VIDEO_EXTENSIONS = new Set([
 
 function usage() {
   console.error(
-    "Usage: node stitch.js <input-folder> [output-file]\n" +
+    "Usage: node stitch.js <input-folder> [output-file] [--bgm <audio-file>]\n" +
       "  input-folder  Directory containing video files\n" +
-      "  output-file   Output filename (default: output.mp4)"
+      "  output-file   Output filename (default: output.mp4)\n" +
+      "  --bgm         Path to background music file (lowers gameplay audio to 75%)"
   );
   process.exit(1);
+}
+
+function parseArgs(argv) {
+  const positional = [];
+  let bgmPath = null;
+
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--bgm") {
+      i++;
+      if (i >= argv.length) {
+        console.error("Error: --bgm requires a path to an audio file.");
+        process.exit(1);
+      }
+      bgmPath = path.resolve(argv[i]);
+    } else {
+      positional.push(argv[i]);
+    }
+  }
+
+  if (positional.length < 1) usage();
+
+  return {
+    inputFolder: path.resolve(positional[0]),
+    outputFile: path.resolve(positional[1] || "output.mp4"),
+    bgmPath,
+  };
 }
 
 function getVideoInfo(filePath) {
@@ -59,14 +86,15 @@ function getVideoInfo(filePath) {
 }
 
 function run() {
-  const args = process.argv.slice(2);
-  if (args.length < 1) usage();
-
-  const inputFolder = path.resolve(args[0]);
-  const outputFile = path.resolve(args[1] || "output.mp4");
+  const { inputFolder, outputFile, bgmPath } = parseArgs(process.argv.slice(2));
 
   if (!fs.existsSync(inputFolder) || !fs.statSync(inputFolder).isDirectory()) {
     console.error(`Error: "${inputFolder}" is not a valid directory.`);
+    process.exit(1);
+  }
+
+  if (bgmPath && !fs.existsSync(bgmPath)) {
+    console.error(`Error: BGM file "${bgmPath}" not found.`);
     process.exit(1);
   }
 
@@ -84,6 +112,7 @@ function run() {
 
   console.log(`Found ${files.length} video file(s):`);
   files.forEach((f) => console.log(`  ${path.basename(f)}`));
+  if (bgmPath) console.log(`BGM: ${path.basename(bgmPath)}`);
 
   // Get resolution and framerate from the first video
   const { width, height, fps } = getVideoInfo(files[0]);
@@ -93,6 +122,9 @@ function run() {
   // Each input gets scaled to target resolution and has its filename overlaid
   const inputArgs = [];
   const filterParts = [];
+
+  // BGM is added as the last input if provided
+  const bgmIndex = bgmPath ? files.length : null;
 
   files.forEach((file, i) => {
     inputArgs.push("-i", file);
@@ -110,17 +142,36 @@ function run() {
     );
   });
 
-  // Concatenate all processed streams
+  if (bgmPath) {
+    inputArgs.push("-i", bgmPath);
+  }
+
+  // Concatenate all processed video streams
   const concatInputs = files.map((_, i) => `[v${i}]`).join("");
-  const filterComplex =
+  const videoConcat =
     filterParts.join("; ") +
     `; ${concatInputs}concat=n=${files.length}:v=1:a=0[outv]`;
 
-  // Build audio concatenation if available
+  // Build audio filter
   const audioConcat = files.map((_, i) => `[${i}:a]`).join("");
-  const filterWithAudio =
-    filterComplex +
-    `; ${audioConcat}concat=n=${files.length}:v=0:a=1[outa]`;
+
+  let filterWithAudio;
+  if (bgmPath) {
+    // Concat gameplay audio, lower to 75%, loop BGM to match length, then mix
+    filterWithAudio =
+      videoConcat +
+      `; ${audioConcat}concat=n=${files.length}:v=0:a=1[gamea]` +
+      `; [gamea]volume=0.75[gamevol]` +
+      `; [${bgmIndex}:a]aloop=loop=-1:size=2147483647[bgmloop]` +
+      `; [gamevol][bgmloop]amix=inputs=2:duration=first:dropout_transition=0[outa]`;
+  } else {
+    filterWithAudio =
+      videoConcat +
+      `; ${audioConcat}concat=n=${files.length}:v=0:a=1[outa]`;
+  }
+
+  // Video-only filter (no audio)
+  const filterVideoOnly = videoConcat;
 
   // Try with audio first, fall back to video-only
   const ffmpegArgs = [
@@ -161,7 +212,7 @@ function run() {
     const videoOnlyArgs = [
       ...inputArgs,
       "-filter_complex",
-      filterComplex,
+      filterVideoOnly,
       "-map",
       "[outv]",
       "-c:v",
