@@ -1,0 +1,12 @@
+{
+  "name": "vidstitch",
+  "version": "1.0.0",
+  "description": "Video stitching tool with progress UI",
+  "main": "stitch.js",
+  "bin": {
+    "vidstitch": "./stitch.js"
+  },
+  "dependencies": {
+    "neo-blessed": "^0.2.0"
+  }
+}
