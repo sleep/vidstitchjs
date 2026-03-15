@@ -562,8 +562,8 @@ async function run() {
   const { screen, logBox, progressBox } = createUI();
 
   // Print header info into the log
-  logBox.log(`Found ${files.length} video file(s):`);
-  files.forEach((f, i) => {
+  logBox.log(`Found ${validFiles.length} video file(s):`);
+  validFiles.forEach((f, i) => {
     logBox.log(`  ${path.basename(f)}  (${formatTime(durations[i])})`);
   });
   if (bgmPath) logBox.log(`BGM: ${path.basename(bgmPath)}`);
@@ -573,12 +573,18 @@ async function run() {
   logBox.log("Starting ffmpeg (with audio)...");
   screen.render();
 
+  if (skipped.length > 0) {
+    logBox.log(`{yellow-fg}Skipped ${skipped.length} corrupted file(s):{/yellow-fg}`);
+    skipped.forEach((name) => logBox.log(`  {yellow-fg}- ${name}{/yellow-fg}`));
+    logBox.log("");
+  }
+
   const code = await runFFmpegTUI(
     screen,
     logBox,
     progressBox,
     withAudioArgs,
-    files,
+    validFiles,
     durations,
     totalDuration
   );
