@@ -484,26 +484,54 @@ async function run() {
 
   console.error(`Found ${files.length} video file(s). Probing files...`);
 
-  // Get target resolution from first file
-  const { width, height, fps } = getVideoInfo(files[0]);
-  console.error(`  Target: ${width}x${height} @ ${fps.toFixed(2)} fps`);
-
-  // Get durations for all files
+  // Probe all files and filter out corrupted ones
+  const validFiles = [];
   const durations = [];
+  const skipped = [];
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     const name = path.basename(f);
+    const pct = Math.round((i / files.length) * 100);
     if (process.stderr.isTTY) {
-      process.stderr.write(`    0% [${i + 1}/${files.length}] ${name}...`);
+      process.stderr.write(`  ${String(pct).padStart(3)}% [${i + 1}/${files.length}] ${name}...`);
     }
-    const dur = getDuration(f);
-    durations.push(dur);
+    let dur = 0;
+    let info = null;
+    try {
+      dur = getDuration(f);
+      info = getVideoInfo(f);
+    } catch {
+      // probe failed — file is unreadable
+    }
     if (process.stderr.isTTY) {
       process.stderr.clearLine(0);
       process.stderr.cursorTo(0);
     }
-    console.error(`  100% [${i + 1}/${files.length}] ${name} → ${formatTime(dur)} (${dur.toFixed(2)}s)`);
+    const donePct = Math.round(((i + 1) / files.length) * 100);
+    if (!info || dur <= 0) {
+      console.error(`  ${String(donePct).padStart(3)}% [${i + 1}/${files.length}] ${name} → SKIPPED (corrupted or unreadable)`);
+      skipped.push(name);
+    } else {
+      console.error(`  ${String(donePct).padStart(3)}% [${i + 1}/${files.length}] ${name} → ${formatTime(dur)} (${dur.toFixed(2)}s)`);
+      validFiles.push(f);
+      durations.push(dur);
+    }
   }
+
+  if (skipped.length > 0) {
+    console.error(`\nWarning: Skipped ${skipped.length} corrupted file(s):`);
+    skipped.forEach((name) => console.error(`  - ${name}`));
+  }
+
+  if (validFiles.length === 0) {
+    console.error("Error: No valid video files found after probing.");
+    process.exit(1);
+  }
+
+  // Get target resolution from first valid file
+  const { width, height, fps } = getVideoInfo(validFiles[0]);
+  console.error(`  Target: ${width}x${height} @ ${fps.toFixed(2)} fps`);
+
   const totalDuration = durations.reduce((a, b) => a + b, 0);
   console.error(`Total duration: ${formatTime(totalDuration)}`);
 
