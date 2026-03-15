@@ -611,7 +611,7 @@ async function run() {
     logBox,
     progressBox,
     videoOnlyArgs,
-    files,
+    validFiles,
     durations,
     totalDuration
   );
