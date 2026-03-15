@@ -164,7 +164,7 @@ function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile) {
     filterParts.push(
       `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
         `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,` +
-        `setsar=1,fps=${fps},` +
+        `setsar=1,format=yuv420p,fps=${fps},` +
         `drawtext=text='${filename}':fontsize=${fontSize}:` +
         `fontcolor=white@0.3:x=(w-tw)/2:y=h-th-20` +
         `[v${i}]`
@@ -306,7 +306,7 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
     let lastStats = {};
 
     // Spawn ffmpeg with progress pipe on stdout, log on stderr
-    const args = ["-nostdin", ...ffmpegArgs, "-nostats", "-progress", "pipe:1"];
+    const args = ["-nostdin", "-nostats", "-progress", "pipe:1", ...ffmpegArgs];
     const proc = spawn("ffmpeg", args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
