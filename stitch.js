@@ -537,7 +537,7 @@ async function run() {
 
   // Build ffmpeg args
   const { withAudioArgs, videoOnlyArgs } = buildFFmpegArgs(
-    files,
+    validFiles,
     width,
     height,
     fps,
@@ -548,8 +548,8 @@ async function run() {
   // ── Legacy mode ──
   const useTui = blessed && !noTui && process.stderr.isTTY;
   if (!useTui) {
-    console.log(`Found ${files.length} video file(s):`);
-    files.forEach((f) => console.log(`  ${path.basename(f)}`));
+    console.log(`Found ${validFiles.length} video file(s):`);
+    validFiles.forEach((f) => console.log(`  ${path.basename(f)}`));
     if (bgmPath) console.log(`BGM: ${path.basename(bgmPath)}`);
     console.log(`\nTarget: ${width}x${height} @ ${fps.toFixed(2)} fps`);
     console.log(`Total duration: ${formatTime(totalDuration)}`);
