@@ -43,6 +43,8 @@ mp4, mkv, avi, mov, wmv, flv, webm, m4v, mpg, mpeg, ts, mts
 
 `--to <n>` — stop at the nth file (inclusive). `--from 5 --to 10` processes files 5 through 10.
 
+`--fat-mode` — limits batch temp files to under 4GB each, for FAT32 filesystems. Batches are split by duration (~15 min per batch) instead of file count.
+
 ### Examples
 
 Basic:
