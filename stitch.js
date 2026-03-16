@@ -509,7 +509,7 @@ function createUI() {
   return { screen, logBox, progressBox };
 }
 
-function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations, totalDuration) {
+function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations, totalDuration, globalCtx) {
   return new Promise((resolve) => {
     // Cumulative durations for file-index tracking
     const cumDurations = [];
@@ -586,9 +586,7 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
       const currentTime = Math.max(0, outTimeUs / 1_000_000);
       const speed = parseFloat(lastStats.speed) || 0;
 
-      const totalFraction = totalDuration > 0 ? currentTime / totalDuration : 0;
-
-      // Find current file
+      // Find current file within this ffmpeg invocation
       let fileIdx = 0;
       for (let i = 0; i < cumDurations.length; i++) {
         if (currentTime >= cumDurations[i]) fileIdx = i;
@@ -597,28 +595,66 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
       const fileDur = durations[fileIdx] || 1;
       const fileFraction = (currentTime - fileStart) / fileDur;
 
-      const elapsed = (Date.now() - startTime) / 1000;
-      const eta = totalFraction > 0.001 ? elapsed / totalFraction - elapsed : 0;
-
       const barWidth = Math.max(10, (screen.width || 80) - 26);
-
       const fileBar = makeBarColored(fileFraction, barWidth, "yellow");
-      const totalBar = makeBarColored(totalFraction, barWidth, "green");
-
       const filePct = (Math.min(1, fileFraction) * 100).toFixed(1);
-      const totalPct = (Math.min(1, totalFraction) * 100).toFixed(1);
       const fileName = path.basename(files[fileIdx]);
       const speedStr = speed > 0 ? speed.toFixed(2) + "x" : "...";
 
-      progressBox.setContent(
-        `  {bold}File ${fileIdx + 1}/${files.length}{/bold}: ${fileName}\n` +
-          `  File   ${fileBar}  ${filePct.padStart(5)}%\n` +
-          `  Total  ${totalBar}  ${totalPct.padStart(5)}%\n` +
-          `\n` +
-          `  Elapsed: {cyan-fg}${formatTime(elapsed)}{/cyan-fg}` +
-          `   Speed: {cyan-fg}${speedStr}{/cyan-fg}` +
-          `   ETA: {cyan-fg}${formatTime(eta)}{/cyan-fg}`
-      );
+      if (globalCtx) {
+        // Batched mode: unified progress across all batches + concat
+        const isConcat = globalCtx.phase === "Stitching";
+        const stepNum = isConcat ? 2 : 1;
+        const stepLabel = isConcat
+          ? "Stitching batches"
+          : `Encoding — Batch ${globalCtx.currentBatch + 1}/${globalCtx.totalBatches}`;
+        const globalFileIdx = isConcat ? fileIdx : globalCtx.fileOffset + fileIdx;
+        const globalFileCount = isConcat ? files.length : globalCtx.totalFiles;
+        const fileLabel = isConcat ? "Batch" : "File";
+
+        // Overall fraction: encoding gets encodingWeight, concat gets the rest
+        let overallFraction;
+        if (isConcat) {
+          const concatFraction = totalDuration > 0 ? currentTime / totalDuration : 0;
+          overallFraction = globalCtx.encodingWeight + concatFraction * (1 - globalCtx.encodingWeight);
+        } else {
+          const globalDurationProgress = globalCtx.durationOffset + currentTime;
+          overallFraction = (globalDurationProgress / globalCtx.totalDuration) * globalCtx.encodingWeight;
+        }
+
+        const totalBar = makeBarColored(overallFraction, barWidth, "green");
+        const totalPct = (Math.min(1, overallFraction) * 100).toFixed(1);
+        const overallElapsed = (Date.now() - globalCtx.startTime) / 1000;
+        const overallEta = overallFraction > 0.001 ? overallElapsed / overallFraction - overallElapsed : 0;
+
+        progressBox.setContent(
+          `  {bold}Step ${stepNum}/2: ${stepLabel}{/bold}\n` +
+            `  ${fileLabel} ${globalFileIdx + 1}/${globalFileCount}: ${fileName}\n` +
+            `  ${fileLabel.padEnd(5)}  ${fileBar}  ${filePct.padStart(5)}%\n` +
+            `  Total  ${totalBar}  ${totalPct.padStart(5)}%\n` +
+            `\n` +
+            `  Elapsed: {cyan-fg}${formatTime(overallElapsed)}{/cyan-fg}` +
+            `   Speed: {cyan-fg}${speedStr}{/cyan-fg}` +
+            `   ETA: {cyan-fg}${formatTime(overallEta)}{/cyan-fg}`
+        );
+      } else {
+        // Non-batched mode: original display
+        const totalFraction = totalDuration > 0 ? currentTime / totalDuration : 0;
+        const totalBar = makeBarColored(totalFraction, barWidth, "green");
+        const totalPct = (Math.min(1, totalFraction) * 100).toFixed(1);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const eta = totalFraction > 0.001 ? elapsed / totalFraction - elapsed : 0;
+
+        progressBox.setContent(
+          `  {bold}File ${fileIdx + 1}/${files.length}{/bold}: ${fileName}\n` +
+            `  File   ${fileBar}  ${filePct.padStart(5)}%\n` +
+            `  Total  ${totalBar}  ${totalPct.padStart(5)}%\n` +
+            `\n` +
+            `  Elapsed: {cyan-fg}${formatTime(elapsed)}{/cyan-fg}` +
+            `   Speed: {cyan-fg}${speedStr}{/cyan-fg}` +
+            `   ETA: {cyan-fg}${formatTime(eta)}{/cyan-fg}`
+        );
+      }
       screen.render();
     }
 
@@ -715,6 +751,19 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
     }
     log("");
 
+    // Global progress context for unified tracking across all batches + concat
+    const globalCtx = useTui ? {
+      startTime: Date.now(),
+      totalFiles: validFiles.length,
+      fileOffset: 0,
+      totalDuration,
+      durationOffset: 0,
+      totalBatches: batches.length,
+      currentBatch: 0,
+      phase: "Encoding",
+      encodingWeight: 0.97,
+    } : null;
+
     // Phase 1: Process batches with audio
     for (let b = 0; b < batches.length; b++) {
       const batch = batches[b];
@@ -728,7 +777,7 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
 
       let code;
       if (useTui) {
-        code = await runFFmpegTUI(screen, logBox, progressBox, withAudioArgs, batch, batchDurs, batchTotal);
+        code = await runFFmpegTUI(screen, logBox, progressBox, withAudioArgs, batch, batchDurs, batchTotal, globalCtx);
       } else {
         code = await runFFmpegInherit(withAudioArgs);
       }
@@ -739,6 +788,11 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
         break;
       }
       intermediates.push(batchOutput);
+      if (globalCtx) {
+        globalCtx.fileOffset += batch.length;
+        globalCtx.durationOffset += batchTotal;
+        globalCtx.currentBatch++;
+      }
       log(`  Batch ${b + 1} complete.`);
     }
 
@@ -747,6 +801,13 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
       intermediates = [];
       log("");
       log("{yellow-fg}Retrying all batches without audio...{/yellow-fg}");
+
+      if (globalCtx) {
+        globalCtx.fileOffset = 0;
+        globalCtx.durationOffset = 0;
+        globalCtx.currentBatch = 0;
+        globalCtx.startTime = Date.now();
+      }
 
       for (let b = 0; b < batches.length; b++) {
         const batch = batches[b];
@@ -760,7 +821,7 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
 
         let code;
         if (useTui) {
-          code = await runFFmpegTUI(screen, logBox, progressBox, videoOnlyArgs, batch, batchDurs, batchTotal);
+          code = await runFFmpegTUI(screen, logBox, progressBox, videoOnlyArgs, batch, batchDurs, batchTotal, globalCtx);
         } else {
           code = await runFFmpegInherit(videoOnlyArgs);
         }
@@ -778,6 +839,11 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
           return;
         }
         intermediates.push(batchOutput);
+        if (globalCtx) {
+          globalCtx.fileOffset += batch.length;
+          globalCtx.durationOffset += batchTotal;
+          globalCtx.currentBatch++;
+        }
         log(`  Batch ${b + 1} complete.`);
       }
     }
@@ -785,6 +851,10 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
     // Phase 2: Concat intermediates using concat demuxer (no re-encoding)
     log("");
     log("{bold}Concatenating batches...{/bold}");
+
+    if (globalCtx) {
+      globalCtx.phase = "Stitching";
+    }
 
     const concatListPath = path.join(tmpDir, "concat_list.txt");
     writeConcatList(intermediates, concatListPath);
@@ -799,7 +869,8 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
       );
       concatCode = await runFFmpegTUI(
         screen, logBox, progressBox, concatArgs,
-        intermediates, batchSumDurations, totalDuration
+        intermediates, batchSumDurations, totalDuration,
+        globalCtx
       );
     } else {
       concatCode = await runFFmpegInherit(concatArgs);
