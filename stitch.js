@@ -35,7 +35,7 @@ const FAT_MAX_BATCH_SECS = 900;
 
 function usage() {
   console.error(
-    "Usage: node stitch.js <input-folder> [output-file] [--bgm <audio-file>] [--no-tui] [--glitch] [--temp-dir <path>]\n" +
+    "Usage: node stitch.js <input-folder> [output-file] [--bgm <audio-file>] [--no-tui] [--glitch] [--fast] [--temp-dir <path>]\n" +
       "  input-folder  Directory containing video files\n" +
       "  output-file   Output filename (default: output.mp4)\n" +
       "  --bgm         Path to background music file (lowers gameplay audio to 75%)\n" +
@@ -46,7 +46,8 @@ function usage() {
       "  --from <n>    Start from the nth file (1-based)\n" +
       "  --to <n>      End at the nth file (1-based, inclusive)\n" +
       "  --fat-mode    Limit batch temp files to <4GB for FAT32 filesystems\n" +
-      "  -r, --recursive  Scan subdirectories for video files"
+      "  -r, --recursive  Scan subdirectories for video files\n" +
+      "  --fast        Encode ~3x faster (x264 veryfast preset, near-identical quality)"
   );
   process.exit(1);
 }
@@ -69,6 +70,7 @@ function parseArgs(argv) {
   let toIdx = null;
   let fatMode = false;
   let recursive = false;
+  let fast = false;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--bgm") {
@@ -100,6 +102,8 @@ function parseArgs(argv) {
       toIdx = parseInt(argv[i], 10);
     } else if (argv[i] === "--fat-mode") {
       fatMode = true;
+    } else if (argv[i] === "--fast") {
+      fast = true;
     } else if (argv[i] === "-r" || argv[i] === "--recursive") {
       recursive = true;
     } else if (argv[i] === "--temp-dir") {
@@ -128,6 +132,7 @@ function parseArgs(argv) {
     toIdx,
     fatMode,
     recursive,
+    fast,
   };
 }
 
@@ -255,7 +260,7 @@ function makeBarColored(fraction, width, color) {
 
 // ── Build ffmpeg filter / args ──────────────────────────────────
 
-function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile, glitchSet) {
+function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile, glitchSet, preset = "medium") {
   const inputArgs = [];
   const videoFilters = [];
   const audioFilters = [];
@@ -319,7 +324,7 @@ function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile, glitchS
     "-c:v",
     "libx264",
     "-preset",
-    "medium",
+    preset,
     "-crf",
     "18",
     "-movflags",
@@ -760,7 +765,7 @@ function runLegacy(ffmpegArgs, outputFile, retryArgs) {
 
 // ── Batched processing ──────────────────────────────────────────
 
-async function processBatched({ validFiles, durations, width, height, fps, bgmPath, outputFile, totalDuration, skipped, useTui, glitchSet, tempDir, noDeleteTemp, fatMode }) {
+async function processBatched({ validFiles, durations, width, height, fps, bgmPath, outputFile, totalDuration, skipped, useTui, glitchSet, tempDir, noDeleteTemp, fatMode, preset }) {
   let tmpDir;
   if (tempDir) {
     fs.mkdirSync(tempDir, { recursive: true });
@@ -827,7 +832,7 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
 
       log(`{bold}Batch ${b + 1}/${batches.length}{/bold} (${batch.length} files, ${formatTime(batchTotal)})...`);
 
-      const { withAudioArgs } = buildFFmpegArgs(batch, width, height, fps, null, batchOutput, glitchSet);
+      const { withAudioArgs } = buildFFmpegArgs(batch, width, height, fps, null, batchOutput, glitchSet, preset);
 
       let code;
       if (useTui) {
@@ -871,7 +876,7 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
 
         log(`{bold}Batch ${b + 1}/${batches.length}{/bold} (video only, ${batch.length} files)...`);
 
-        const { videoOnlyArgs } = buildFFmpegArgs(batch, width, height, fps, null, batchOutput, glitchSet);
+        const { videoOnlyArgs } = buildFFmpegArgs(batch, width, height, fps, null, batchOutput, glitchSet, preset);
 
         let code;
         if (useTui) {
@@ -966,7 +971,7 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
 // ── Main ────────────────────────────────────────────────────────
 
 async function run() {
-  const { inputFolder, outputFile, bgmPath, noTui, glitch, tempDir, noDeleteTemp, fromIdx, toIdx, fatMode, recursive } = parseArgs(
+  const { inputFolder, outputFile, bgmPath, noTui, glitch, tempDir, noDeleteTemp, fromIdx, toIdx, fatMode, recursive, fast } = parseArgs(
     process.argv.slice(2)
   );
 
@@ -1077,6 +1082,7 @@ async function run() {
   }
 
   const useTui = blessed && !noTui && process.stderr.isTTY;
+  const preset = fast ? "veryfast" : "medium";
 
   // ── Batched mode for large file counts ──
   // When there are many files, ffmpeg hits the OS file descriptor limit
@@ -1084,7 +1090,7 @@ async function run() {
   if (validFiles.length > BATCH_SIZE) {
     await processBatched({
       validFiles, durations, width, height, fps, bgmPath,
-      outputFile, totalDuration, skipped, useTui, glitchSet, tempDir, noDeleteTemp, fatMode,
+      outputFile, totalDuration, skipped, useTui, glitchSet, tempDir, noDeleteTemp, fatMode, preset,
     });
     return;
   }
@@ -1097,7 +1103,8 @@ async function run() {
     fps,
     bgmPath,
     outputFile,
-    glitchSet
+    glitchSet,
+    preset
   );
 
   // ── Legacy mode ──

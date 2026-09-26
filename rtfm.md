@@ -45,6 +45,8 @@ mp4, mkv, avi, mov, wmv, flv, webm, m4v, mpg, mpeg, ts, mts
 
 `--fat-mode` — limits batch temp files to under 4GB each, for FAT32 filesystems. Batches are split by duration (~15 min per batch) instead of file count.
 
+`--fast` — encodes roughly 3x faster by using x264's `veryfast` preset instead of `medium`. Quality is near-identical at the same CRF and files are usually a bit smaller. Worth using for long sessions.
+
 ### Examples
 
 Basic:
