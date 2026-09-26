@@ -136,6 +136,9 @@ function parseArgs(argv) {
 function collectVideoFiles(dir, recursive) {
   const out = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    // Skip hidden entries: macOS AppleDouble "._*" sidecars on FAT/exFAT
+    // drives, plus .Trashes, .Spotlight-V100, etc.
+    if (entry.name.startsWith(".")) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       if (recursive) out.push(...collectVideoFiles(full, recursive));
