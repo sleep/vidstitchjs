@@ -45,7 +45,8 @@ function usage() {
       "  --no-delete-temp  Keep temporary batch files after completion\n" +
       "  --from <n>    Start from the nth file (1-based)\n" +
       "  --to <n>      End at the nth file (1-based, inclusive)\n" +
-      "  --fat-mode    Limit batch temp files to <4GB for FAT32 filesystems"
+      "  --fat-mode    Limit batch temp files to <4GB for FAT32 filesystems\n" +
+      "  -r, --recursive  Scan subdirectories for video files"
   );
   process.exit(1);
 }
@@ -67,6 +68,7 @@ function parseArgs(argv) {
   let fromIdx = null;
   let toIdx = null;
   let fatMode = false;
+  let recursive = false;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--bgm") {
@@ -98,6 +100,8 @@ function parseArgs(argv) {
       toIdx = parseInt(argv[i], 10);
     } else if (argv[i] === "--fat-mode") {
       fatMode = true;
+    } else if (argv[i] === "-r" || argv[i] === "--recursive") {
+      recursive = true;
     } else if (argv[i] === "--temp-dir") {
       i++;
       if (i >= argv.length) {
@@ -123,7 +127,26 @@ function parseArgs(argv) {
     fromIdx,
     toIdx,
     fatMode,
+    recursive,
   };
+}
+
+// ── File scanning ───────────────────────────────────────────────
+
+function collectVideoFiles(dir, recursive) {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (recursive) out.push(...collectVideoFiles(full, recursive));
+    } else if (
+      entry.isFile() &&
+      VIDEO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+    ) {
+      out.push(full);
+    }
+  }
+  return out;
 }
 
 // ── ffprobe helpers ─────────────────────────────────────────────
@@ -912,7 +935,7 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
 // ── Main ────────────────────────────────────────────────────────
 
 async function run() {
-  const { inputFolder, outputFile, bgmPath, noTui, glitch, tempDir, noDeleteTemp, fromIdx, toIdx, fatMode } = parseArgs(
+  const { inputFolder, outputFile, bgmPath, noTui, glitch, tempDir, noDeleteTemp, fromIdx, toIdx, fatMode, recursive } = parseArgs(
     process.argv.slice(2)
   );
 
@@ -929,12 +952,10 @@ async function run() {
     process.exit(1);
   }
 
-  console.error("Scanning for video files...");
-  const files = fs
-    .readdirSync(inputFolder)
-    .filter((f) => VIDEO_EXTENSIONS.has(path.extname(f).toLowerCase()))
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-    .map((f) => path.join(inputFolder, f));
+  console.error(`Scanning for video files${recursive ? " (recursive)" : ""}...`);
+  const files = collectVideoFiles(inputFolder, recursive).sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true })
+  );
 
   if (files.length === 0) {
     console.error("No video files found in the input folder.");
