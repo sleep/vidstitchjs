@@ -349,6 +349,32 @@ function makeBarColored(fraction, width, color) {
   );
 }
 
+// ── Process helpers ─────────────────────────────────────────────
+
+// A failed spawn (missing binary, EACCES, ...) emits 'error'; without a
+// listener that surfaces as an unhandled exception with a useless stack.
+function guardSpawnError(proc, bin = "ffmpeg") {
+  proc.on("error", (err) => {
+    console.error(`\nError: failed to start ${bin}: ${err.message}`);
+    process.exit(1);
+  });
+}
+
+// Fail fast with a clear message instead of marking every file "corrupted"
+// because ffprobe invocations start failing.
+function checkDependencies() {
+  for (const bin of ["ffmpeg", "ffprobe"]) {
+    try {
+      execFileSync(bin, ["-version"], { stdio: "ignore", timeout: 10000 });
+    } catch {
+      console.error(
+        `Error: "${bin}" is not installed or not on your PATH (ffmpeg and ffprobe are both required).`
+      );
+      process.exit(1);
+    }
+  }
+}
+
 // ── Build ffmpeg filter / args ──────────────────────────────────
 
 function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile, glitchSet, preset = "medium") {
@@ -534,9 +560,13 @@ async function detectGlitchFiles(files) {
       const proc = spawn("ffmpeg", [
         "-v", "error", "-nostdin", "-i", filePath, "-f", "null", "-",
       ], { stdio: ["ignore", "ignore", "pipe"] });
+      guardSpawnError(proc);
 
       let stderr = "";
-      proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      proc.stderr.on("data", (chunk) => {
+        // Cap accumulation: a badly corrupted file can spam errors
+        if (stderr.length < 64 * 1024) stderr += chunk.toString();
+      });
       proc.on("close", () => {
         completed++;
         const hasErrors = stderr.trim().length > 0;
@@ -583,6 +613,7 @@ function runFFmpegInherit(args) {
     const proc = spawn("ffmpeg", ["-nostdin", ...args], {
       stdio: "inherit",
     });
+    guardSpawnError(proc);
     proc.on("close", (code) => resolve(code));
   });
 }
@@ -678,6 +709,7 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
     const proc = spawn("ffmpeg", args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
+    guardSpawnError(proc);
 
     // Let q / ctrl-c kill the process
     const killHandler = () => {
@@ -830,6 +862,7 @@ function runLegacy(ffmpegArgs, outputFile, retryArgs) {
   const proc = spawn("ffmpeg", ["-nostdin", ...ffmpegArgs], {
     stdio: "inherit",
   });
+  guardSpawnError(proc);
   proc.on("close", (code) => {
     if (code === 0) {
       console.log(`\nDone! Output saved to ${outputFile}`);
@@ -843,6 +876,7 @@ function runLegacy(ffmpegArgs, outputFile, retryArgs) {
     const proc2 = spawn("ffmpeg", ["-nostdin", ...retryArgs], {
       stdio: "inherit",
     });
+    guardSpawnError(proc2);
     proc2.on("close", (code2) => {
       if (code2 === 0) {
         console.log(`\nDone! Output saved to ${outputFile} (video only)`);
@@ -1066,6 +1100,8 @@ async function run() {
     process.argv.slice(2)
   );
 
+  checkDependencies();
+
   if (!fs.existsSync(inputFolder) || !fs.statSync(inputFolder).isDirectory()) {
     console.error(`Error: "${inputFolder}" is not a valid directory.`);
     process.exit(1);
@@ -1253,4 +1289,7 @@ async function run() {
   screen.render();
 }
 
-run();
+run().catch((err) => {
+  console.error(`\nError: ${err.message}`);
+  process.exit(1);
+});
