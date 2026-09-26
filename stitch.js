@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { execSync, execFileSync, spawn } = require("child_process");
+const { execFile, execFileSync, spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -167,60 +167,68 @@ function collectVideoFiles(dir, recursive) {
 
 // ── ffprobe helpers ─────────────────────────────────────────────
 
-function probe(filePath, showFlags) {
-  const cmd = [
-    "ffprobe",
-    "-v",
-    "quiet",
-    "-print_format",
-    "json",
-    ...showFlags,
-    filePath,
-  ];
-  const result = execSync(cmd.map((c) => `"${c}"`).join(" "), {
-    encoding: "utf-8",
+// Shell-free execution: filenames with quotes, spaces, or "$()" must not
+// reach a shell.
+function ffprobeJson(args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "ffprobe",
+      ["-v", "quiet", "-print_format", "json", ...args],
+      { encoding: "utf-8", maxBuffer: 32 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return reject(err);
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (parseErr) {
+          reject(parseErr);
+        }
+      }
+    );
   });
-  return JSON.parse(result);
 }
 
-function getVideoInfo(filePath) {
-  const data = probe(filePath, ["-show_streams", "-select_streams", "v:0"]);
+// One ffprobe call per file: format duration plus first video stream params.
+async function probeVideoInfo(filePath) {
+  const data = await ffprobeJson([
+    "-show_format",
+    "-show_streams",
+    "-select_streams",
+    "v:0",
+    filePath,
+  ]);
   const stream = data.streams && data.streams[0];
   if (!stream) throw new Error(`No video stream found in ${filePath}`);
+
+  let duration = parseFloat(data.format?.duration);
+  if (!(duration > 0)) {
+    // Recordings that were cut off (crash, disk full) never get the MKV
+    // duration header written. Fall back to the last video packet's timestamp.
+    duration = await getDurationFromPackets(filePath);
+  }
 
   let fps = 30;
   if (stream.r_frame_rate) {
     const [num, den] = stream.r_frame_rate.split("/").map(Number);
     if (den > 0) fps = num / den;
   }
-  return { width: stream.width, height: stream.height, fps };
+  return { width: stream.width, height: stream.height, fps, duration };
 }
 
-function getDuration(filePath) {
+async function getDurationFromPackets(filePath) {
   try {
-    const data = probe(filePath, ["-show_format"]);
-    const dur = parseFloat(data.format?.duration);
-    if (dur > 0) return dur;
-  } catch {
-    return 0;
-  }
-  // Recordings that were cut off (crash, disk full) never get the MKV
-  // duration header written. Fall back to the last video packet's timestamp.
-  return getDurationFromPackets(filePath);
-}
-
-function getDurationFromPackets(filePath) {
-  try {
-    const args = [
-      "-v", "quiet",
-      "-select_streams", "v:0",
-      "-show_entries", "packet=pts_time",
-      "-of", "csv=p=0",
-      filePath,
-    ];
-    const out = execFileSync("ffprobe", args, {
-      encoding: "utf-8",
-      maxBuffer: 256 * 1024 * 1024,
+    const out = await new Promise((resolve, reject) => {
+      execFile(
+        "ffprobe",
+        [
+          "-v", "quiet",
+          "-select_streams", "v:0",
+          "-show_entries", "packet=pts_time",
+          "-of", "csv=p=0",
+          filePath,
+        ],
+        { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 },
+        (err, stdout) => (err ? reject(err) : resolve(stdout))
+      );
     });
     let max = 0;
     for (const line of out.split("\n")) {
@@ -231,6 +239,81 @@ function getDurationFromPackets(filePath) {
   } catch {
     return 0;
   }
+}
+
+// Probes every file in parallel (a small pool of ffprobe workers) and splits
+// the results into valid files and corrupted/unreadable skips, preserving the
+// original sort order.
+async function probeFiles(selectedFiles) {
+  const results = new Array(selectedFiles.length).fill(null);
+  const concurrency = Math.min(os.cpus().length, 8);
+  let idx = 0;
+  let completed = 0;
+
+  async function probeOne(i) {
+    const f = selectedFiles[i];
+    const name = path.basename(f);
+    let dur = 0;
+    let info = null;
+    try {
+      info = await probeVideoInfo(f);
+      dur = info.duration;
+    } catch {
+      // probe failed — file is unreadable
+    }
+    completed++;
+    const pct = Math.round((completed / selectedFiles.length) * 100);
+    const status =
+      info && dur > 0
+        ? `${formatTime(dur)} (${dur.toFixed(2)}s)`
+        : "SKIPPED (corrupted or unreadable)";
+    if (process.stderr.isTTY) {
+      process.stderr.clearLine(0);
+      process.stderr.cursorTo(0);
+      process.stderr.write(
+        `  ${String(pct).padStart(3)}% [${completed}/${selectedFiles.length}] ${name} → ${status}`
+      );
+    } else {
+      console.error(
+        `  ${String(pct).padStart(3)}% [${completed}/${selectedFiles.length}] ${name} → ${status}`
+      );
+    }
+    results[i] = { file: f, dur, info };
+  }
+
+  async function worker() {
+    while (idx < selectedFiles.length) {
+      const i = idx++;
+      await probeOne(i);
+    }
+  }
+
+  const workers = [];
+  for (let i = 0; i < Math.min(concurrency, selectedFiles.length); i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  if (process.stderr.isTTY) {
+    process.stderr.clearLine(0);
+    process.stderr.cursorTo(0);
+  }
+
+  const validFiles = [];
+  const durations = [];
+  const infos = [];
+  const skipped = [];
+  for (const r of results) {
+    if (!r) continue;
+    if (!r.info || r.dur <= 0) {
+      skipped.push(path.basename(r.file));
+    } else {
+      validFiles.push(r.file);
+      durations.push(r.dur);
+      infos.push(r.info);
+    }
+  }
+  return { validFiles, durations, infos, skipped };
 }
 
 // ── Formatting helpers ──────────────────────────────────────────
@@ -1026,39 +1109,8 @@ async function run() {
 
   console.error(`Found ${selectedFiles.length} video file(s). Probing files...`);
 
-  // Probe all files and filter out corrupted ones
-  const validFiles = [];
-  const durations = [];
-  const skipped = [];
-  for (let i = 0; i < selectedFiles.length; i++) {
-    const f = selectedFiles[i];
-    const name = path.basename(f);
-    const pct = Math.round((i / selectedFiles.length) * 100);
-    if (process.stderr.isTTY) {
-      process.stderr.write(`  ${String(pct).padStart(3)}% [${i + 1}/${selectedFiles.length}] ${name}...`);
-    }
-    let dur = 0;
-    let info = null;
-    try {
-      dur = getDuration(f);
-      info = getVideoInfo(f);
-    } catch {
-      // probe failed — file is unreadable
-    }
-    if (process.stderr.isTTY) {
-      process.stderr.clearLine(0);
-      process.stderr.cursorTo(0);
-    }
-    const donePct = Math.round(((i + 1) / selectedFiles.length) * 100);
-    if (!info || dur <= 0) {
-      console.error(`  ${String(donePct).padStart(3)}% [${i + 1}/${selectedFiles.length}] ${name} → SKIPPED (corrupted or unreadable)`);
-      skipped.push(name);
-    } else {
-      console.error(`  ${String(donePct).padStart(3)}% [${i + 1}/${selectedFiles.length}] ${name} → ${formatTime(dur)} (${dur.toFixed(2)}s)`);
-      validFiles.push(f);
-      durations.push(dur);
-    }
-  }
+  // Probe all files (in parallel) and filter out corrupted ones
+  const { validFiles, durations, infos, skipped } = await probeFiles(selectedFiles);
 
   if (skipped.length > 0) {
     console.error(`\nWarning: Skipped ${skipped.length} corrupted file(s):`);
@@ -1071,7 +1123,7 @@ async function run() {
   }
 
   // Get target resolution from first valid file
-  const { width, height, fps } = getVideoInfo(validFiles[0]);
+  const { width, height, fps } = infos[0];
   console.error(`  Target: ${width}x${height} @ ${fps.toFixed(2)} fps`);
 
   const totalDuration = durations.reduce((a, b) => a + b, 0);
