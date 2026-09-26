@@ -30,6 +30,11 @@ const VIDEO_EXTENSIONS = new Set([
 const BATCH_SIZE = 50;
 // ~15 min per batch at CRF 18 1080p60 stays safely under 4GB FAT32 limit
 const FAT_MAX_BATCH_SECS = 900;
+const AUDIO_SAMPLE_RATE = 48000;
+const BGM_GAME_VOLUME = 0.75;
+// Encoding is ~97% of batched wall time; the concat step gets the remainder
+const ENCODING_WEIGHT = 0.97;
+const GLITCH_STDERR_LIMIT = 64 * 1024;
 
 // ── Argument parsing ────────────────────────────────────────────
 
@@ -241,17 +246,31 @@ async function getDurationFromPackets(filePath) {
   }
 }
 
+// Runs workerFn over items with a fixed pool of concurrent workers.
+async function runPool(items, concurrency, workerFn) {
+  let idx = 0;
+  async function worker() {
+    while (idx < items.length) {
+      const i = idx++;
+      await workerFn(items[i], i);
+    }
+  }
+  const workers = [];
+  for (let i = 0; i < Math.min(concurrency, items.length); i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+}
+
 // Probes every file in parallel (a small pool of ffprobe workers) and splits
 // the results into valid files and corrupted/unreadable skips, preserving the
 // original sort order.
 async function probeFiles(selectedFiles) {
   const results = new Array(selectedFiles.length).fill(null);
   const concurrency = Math.min(os.cpus().length, 8);
-  let idx = 0;
   let completed = 0;
 
-  async function probeOne(i) {
-    const f = selectedFiles[i];
+  await runPool(selectedFiles, concurrency, async (f, i) => {
     const name = path.basename(f);
     let dur = 0;
     let info = null;
@@ -279,20 +298,7 @@ async function probeFiles(selectedFiles) {
       );
     }
     results[i] = { file: f, dur, info };
-  }
-
-  async function worker() {
-    while (idx < selectedFiles.length) {
-      const i = idx++;
-      await probeOne(i);
-    }
-  }
-
-  const workers = [];
-  for (let i = 0; i < Math.min(concurrency, selectedFiles.length); i++) {
-    workers.push(worker());
-  }
-  await Promise.all(workers);
+  });
 
   if (process.stderr.isTTY) {
     process.stderr.clearLine(0);
@@ -327,13 +333,6 @@ function formatTime(seconds) {
   if (h > 0)
     return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
   return `${m}:${String(sec).padStart(2, "0")}`;
-}
-
-function makeBar(fraction, width) {
-  const clamped = Math.max(0, Math.min(1, fraction));
-  const filled = Math.round(clamped * width);
-  const empty = width - filled;
-  return "\u2588".repeat(filled) + "\u2591".repeat(empty);
 }
 
 function makeBarColored(fraction, width, color) {
@@ -377,7 +376,7 @@ function checkDependencies() {
 
 // ── Build ffmpeg filter / args ──────────────────────────────────
 
-function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile, glitchSet, preset = "medium") {
+function buildFFmpegArgs({ files, width, height, fps, bgmPath, outputFile, glitchSet, preset = "medium" }) {
   const inputArgs = [];
   const videoFilters = [];
   const audioFilters = [];
@@ -405,7 +404,7 @@ function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile, glitchS
     // Normalize audio: consistent sample rate, sample format, and channel layout
     // so the concat filter doesn't produce drift or glitches between segments
     audioFilters.push(
-      `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`
+      `[${i}:a]aresample=${AUDIO_SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`
     );
   });
 
@@ -422,8 +421,8 @@ function buildFFmpegArgs(files, width, height, fps, bgmPath, outputFile, glitchS
     filterWithAudio =
       allFilters +
       `; ${concatInputs}concat=n=${files.length}:v=1:a=1[outv][gamea]` +
-      `; [gamea]volume=0.75[gamevol]` +
-      `; [${bgmIndex}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[bgmnorm]` +
+      `; [gamea]volume=${BGM_GAME_VOLUME}[gamevol]` +
+      `; [${bgmIndex}:a]aresample=${AUDIO_SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo[bgmnorm]` +
       `; [gamevol][bgmnorm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[outa]`;
   } else {
     filterWithAudio =
@@ -530,8 +529,8 @@ function buildConcatArgs(concatListPath, bgmPath, outputFile) {
       "-stream_loop", "-1", "-i", bgmPath,
       "-c:v", "copy",
       "-filter_complex",
-      "[0:a]volume=0.75[gamevol];" +
-        "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[bgmnorm];" +
+      `[0:a]volume=${BGM_GAME_VOLUME}[gamevol];` +
+        `[1:a]aresample=${AUDIO_SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo[bgmnorm];` +
         "[gamevol][bgmnorm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[outa]",
       "-map", "0:v", "-map", "[outa]",
       "-c:a", "aac", "-b:a", "192k",
@@ -553,7 +552,6 @@ async function detectGlitchFiles(files) {
   const glitchSet = new Set();
   const concurrency = Math.min(os.cpus().length, 8);
   let completed = 0;
-  let idx = 0;
 
   function checkFile(filePath) {
     return new Promise((resolve) => {
@@ -565,7 +563,7 @@ async function detectGlitchFiles(files) {
       let stderr = "";
       proc.stderr.on("data", (chunk) => {
         // Cap accumulation: a badly corrupted file can spam errors
-        if (stderr.length < 64 * 1024) stderr += chunk.toString();
+        if (stderr.length < GLITCH_STDERR_LIMIT) stderr += chunk.toString();
       });
       proc.on("close", () => {
         completed++;
@@ -587,18 +585,7 @@ async function detectGlitchFiles(files) {
     });
   }
 
-  async function worker() {
-    while (idx < files.length) {
-      const i = idx++;
-      await checkFile(files[i]);
-    }
-  }
-
-  const workers = [];
-  for (let i = 0; i < Math.min(concurrency, files.length); i++) {
-    workers.push(worker());
-  }
-  await Promise.all(workers);
+  await runPool(files, concurrency, (filePath) => checkFile(filePath));
 
   if (process.stderr.isTTY) {
     process.stderr.clearLine(0);
@@ -690,7 +677,19 @@ function createUI() {
   return { screen, logBox, progressBox };
 }
 
-function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations, totalDuration, globalCtx) {
+// Renders a terminal state (success or failure) in the progress box and
+// mirrors it into the log.
+function showTuiOutcome({ progressBox, logBox, screen, ok, detail, logMessage }) {
+  progressBox.setContent(
+    ok
+      ? `\n  {green-fg}{bold}Done!{/bold}{/green-fg} ${detail}\n\n  Press {bold}q{/bold} to exit.`
+      : `\n  {red-fg}{bold}Error:{/bold} ${detail}{/red-fg}\n\n  Press {bold}q{/bold} to exit.`
+  );
+  if (logMessage) logBox.log(logMessage);
+  screen.render();
+}
+
+function runFFmpegTUI({ screen, logBox, progressBox, ffmpegArgs, files, durations, totalDuration, globalCtx }) {
   return new Promise((resolve) => {
     // Cumulative durations for file-index tracking
     const cumDurations = [];
@@ -703,6 +702,7 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
     const startTime = Date.now();
     let progressBuffer = "";
     let lastStats = {};
+    let curFileIdx = 0;
 
     // Spawn ffmpeg with progress pipe on stdout, log on stderr
     const args = ["-nostdin", "-nostats", "-progress", "pipe:1", ...ffmpegArgs];
@@ -763,16 +763,27 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
       updateProgressUI();
     }
 
+    function formatFooter(speedStr, elapsed, fraction) {
+      const eta = fraction > 0.001 ? elapsed / fraction - elapsed : 0;
+      return (
+        `\n` +
+        `  Elapsed: {cyan-fg}${formatTime(elapsed)}{/cyan-fg}` +
+        `   Speed: {cyan-fg}${speedStr}{/cyan-fg}` +
+        `   ETA: {cyan-fg}${formatTime(eta)}{/cyan-fg}`
+      );
+    }
+
     function updateProgressUI() {
       const outTimeUs = parseInt(lastStats.out_time_us, 10) || 0;
       const currentTime = Math.max(0, outTimeUs / 1_000_000);
       const speed = parseFloat(lastStats.speed) || 0;
 
-      // Find current file within this ffmpeg invocation
-      let fileIdx = 0;
-      for (let i = 0; i < cumDurations.length; i++) {
-        if (currentTime >= cumDurations[i]) fileIdx = i;
+      // Find current file within this ffmpeg invocation. out_time only moves
+      // forward, so continue from the last match instead of rescanning.
+      while (curFileIdx + 1 < cumDurations.length && currentTime >= cumDurations[curFileIdx + 1]) {
+        curFileIdx++;
       }
+      const fileIdx = curFileIdx;
       const fileStart = cumDurations[fileIdx];
       const fileDur = durations[fileIdx] || 1;
       const fileFraction = (currentTime - fileStart) / fileDur;
@@ -807,17 +818,13 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
         const totalBar = makeBarColored(overallFraction, barWidth, "green");
         const totalPct = (Math.min(1, overallFraction) * 100).toFixed(1);
         const overallElapsed = (Date.now() - globalCtx.startTime) / 1000;
-        const overallEta = overallFraction > 0.001 ? overallElapsed / overallFraction - overallElapsed : 0;
 
         progressBox.setContent(
           `  {bold}Step ${stepNum}/2: ${stepLabel}{/bold}\n` +
             `  ${fileLabel} ${globalFileIdx + 1}/${globalFileCount}: ${fileName}\n` +
             `  ${fileLabel.padEnd(5)}  ${fileBar}  ${filePct.padStart(5)}%\n` +
             `  Total  ${totalBar}  ${totalPct.padStart(5)}%\n` +
-            `\n` +
-            `  Elapsed: {cyan-fg}${formatTime(overallElapsed)}{/cyan-fg}` +
-            `   Speed: {cyan-fg}${speedStr}{/cyan-fg}` +
-            `   ETA: {cyan-fg}${formatTime(overallEta)}{/cyan-fg}`
+            formatFooter(speedStr, overallElapsed, overallFraction)
         );
       } else {
         // Non-batched mode: original display
@@ -825,16 +832,12 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
         const totalBar = makeBarColored(totalFraction, barWidth, "green");
         const totalPct = (Math.min(1, totalFraction) * 100).toFixed(1);
         const elapsed = (Date.now() - startTime) / 1000;
-        const eta = totalFraction > 0.001 ? elapsed / totalFraction - elapsed : 0;
 
         progressBox.setContent(
           `  {bold}File ${fileIdx + 1}/${files.length}{/bold}: ${fileName}\n` +
             `  File   ${fileBar}  ${filePct.padStart(5)}%\n` +
             `  Total  ${totalBar}  ${totalPct.padStart(5)}%\n` +
-            `\n` +
-            `  Elapsed: {cyan-fg}${formatTime(elapsed)}{/cyan-fg}` +
-            `   Speed: {cyan-fg}${speedStr}{/cyan-fg}` +
-            `   ETA: {cyan-fg}${formatTime(eta)}{/cyan-fg}`
+            formatFooter(speedStr, elapsed, totalFraction)
         );
       }
       screen.render();
@@ -858,34 +861,24 @@ function runFFmpegTUI(screen, logBox, progressBox, ffmpegArgs, files, durations,
 
 // ── Legacy mode (no TUI) ───────────────────────────────────────
 
-function runLegacy(ffmpegArgs, outputFile, retryArgs) {
-  const proc = spawn("ffmpeg", ["-nostdin", ...ffmpegArgs], {
-    stdio: "inherit",
-  });
-  guardSpawnError(proc);
-  proc.on("close", (code) => {
-    if (code === 0) {
-      console.log(`\nDone! Output saved to ${outputFile}`);
-      return;
-    }
-    if (!retryArgs) {
-      console.error(`\nffmpeg exited with code ${code}`);
-      process.exit(code);
-    }
-    console.log("\nRetrying without audio...");
-    const proc2 = spawn("ffmpeg", ["-nostdin", ...retryArgs], {
-      stdio: "inherit",
-    });
-    guardSpawnError(proc2);
-    proc2.on("close", (code2) => {
-      if (code2 === 0) {
-        console.log(`\nDone! Output saved to ${outputFile} (video only)`);
-      } else {
-        console.error(`\nffmpeg exited with code ${code2}`);
-        process.exit(code2);
-      }
-    });
-  });
+async function runLegacy(withAudioArgs, outputFile, videoOnlyArgs) {
+  let code = await runFFmpegInherit(withAudioArgs);
+  if (code === 0) {
+    console.log(`\nDone! Output saved to ${outputFile}`);
+    return;
+  }
+  if (!videoOnlyArgs) {
+    console.error(`\nffmpeg exited with code ${code}`);
+    process.exit(code);
+  }
+  console.log("\nRetrying without audio...");
+  code = await runFFmpegInherit(videoOnlyArgs);
+  if (code === 0) {
+    console.log(`\nDone! Output saved to ${outputFile} (video only)`);
+  } else {
+    console.error(`\nffmpeg exited with code ${code}`);
+    process.exit(code);
+  }
 }
 
 // ── Batched processing ──────────────────────────────────────────
@@ -900,15 +893,9 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
   }
 
   try {
-    let batches, batchDurations;
-    if (fatMode) {
-      ({ batches, batchDurations } = chunkByDuration(validFiles, durations, FAT_MAX_BATCH_SECS, BATCH_SIZE));
-    } else {
-      batches = chunkArray(validFiles, BATCH_SIZE);
-      batchDurations = chunkArray(durations, BATCH_SIZE);
-    }
-    let intermediates = [];
-    let audioFailed = false;
+    const { batches, batchDurations } = fatMode
+      ? chunkByDuration(validFiles, durations, FAT_MAX_BATCH_SECS, BATCH_SIZE)
+      : { batches: chunkArray(validFiles, BATCH_SIZE), batchDurations: chunkArray(durations, BATCH_SIZE) };
 
     let screen, logBox, progressBox;
     if (useTui) {
@@ -945,46 +932,52 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
       totalBatches: batches.length,
       currentBatch: 0,
       phase: "Encoding",
-      encodingWeight: 0.97,
+      encodingWeight: ENCODING_WEIGHT,
     } : null;
 
-    // Phase 1: Process batches with audio
-    for (let b = 0; b < batches.length; b++) {
-      const batch = batches[b];
-      const batchDurs = batchDurations[b];
-      const batchTotal = batchDurs.reduce((a, c) => a + c, 0);
-      const batchOutput = path.join(tmpDir, `batch_${b}.mp4`);
+    // Phase 1: encode every batch. If any batch fails — typically a clip with
+    // no audio track, which breaks the per-file audio filters — all batches
+    // are re-encoded without audio so the concat sees uniform streams.
+    async function encodeBatches(withAudio) {
+      const done = [];
+      for (let b = 0; b < batches.length; b++) {
+        const batch = batches[b];
+        const batchDurs = batchDurations[b];
+        const batchTotal = batchDurs.reduce((a, c) => a + c, 0);
+        const batchOutput = path.join(tmpDir, withAudio ? `batch_${b}.mp4` : `batch_${b}_vo.mp4`);
 
-      log(`{bold}Batch ${b + 1}/${batches.length}{/bold} (${batch.length} files, ${formatTime(batchTotal)})...`);
+        log(
+          withAudio
+            ? `{bold}Batch ${b + 1}/${batches.length}{/bold} (${batch.length} files, ${formatTime(batchTotal)})...`
+            : `{bold}Batch ${b + 1}/${batches.length}{/bold} (video only, ${batch.length} files)...`
+        );
 
-      const { withAudioArgs } = buildFFmpegArgs(batch, width, height, fps, null, batchOutput, glitchSet, preset);
+        const { withAudioArgs, videoOnlyArgs } = buildFFmpegArgs({
+          files: batch, width, height, fps, bgmPath: null, outputFile: batchOutput, glitchSet, preset,
+        });
+        const ffmpegArgs = withAudio ? withAudioArgs : videoOnlyArgs;
 
-      let code;
-      if (useTui) {
-        code = await runFFmpegTUI(screen, logBox, progressBox, withAudioArgs, batch, batchDurs, batchTotal, globalCtx);
-      } else {
-        code = await runFFmpegInherit(withAudioArgs);
+        const code = useTui
+          ? await runFFmpegTUI({ screen, logBox, progressBox, ffmpegArgs, files: batch, durations: batchDurs, totalDuration: batchTotal, globalCtx })
+          : await runFFmpegInherit(ffmpegArgs);
+
+        if (code !== 0) return { code, failedBatch: b };
+        done.push(batchOutput);
+        if (globalCtx) {
+          globalCtx.fileOffset += batch.length;
+          globalCtx.durationOffset += batchTotal;
+          globalCtx.currentBatch++;
+        }
+        log(`  Batch ${b + 1} complete.`);
       }
-
-      if (code !== 0) {
-        log("{yellow-fg}Audio encoding failed. Will retry all batches without audio...{/yellow-fg}");
-        audioFailed = true;
-        break;
-      }
-      intermediates.push(batchOutput);
-      if (globalCtx) {
-        globalCtx.fileOffset += batch.length;
-        globalCtx.durationOffset += batchTotal;
-        globalCtx.currentBatch++;
-      }
-      log(`  Batch ${b + 1} complete.`);
+      return { code: 0, done };
     }
 
-    // Phase 1b: If audio failed, re-process all batches without audio
-    if (audioFailed) {
-      intermediates = [];
-      log("");
-      log("{yellow-fg}Retrying all batches without audio...{/yellow-fg}");
+    let audioFailed = false;
+    let encoded = await encodeBatches(true);
+    if (encoded.code !== 0) {
+      log("{yellow-fg}Audio encoding failed. Will retry all batches without audio...{/yellow-fg}");
+      audioFailed = true;
 
       if (globalCtx) {
         globalCtx.fileOffset = 0;
@@ -993,44 +986,24 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
         globalCtx.startTime = Date.now();
       }
 
-      for (let b = 0; b < batches.length; b++) {
-        const batch = batches[b];
-        const batchDurs = batchDurations[b];
-        const batchTotal = batchDurs.reduce((a, c) => a + c, 0);
-        const batchOutput = path.join(tmpDir, `batch_${b}_vo.mp4`);
-
-        log(`{bold}Batch ${b + 1}/${batches.length}{/bold} (video only, ${batch.length} files)...`);
-
-        const { videoOnlyArgs } = buildFFmpegArgs(batch, width, height, fps, null, batchOutput, glitchSet, preset);
-
-        let code;
+      log("");
+      log("{yellow-fg}Retrying all batches without audio...{/yellow-fg}");
+      encoded = await encodeBatches(false);
+      if (encoded.code !== 0) {
         if (useTui) {
-          code = await runFFmpegTUI(screen, logBox, progressBox, videoOnlyArgs, batch, batchDurs, batchTotal, globalCtx);
+          showTuiOutcome({
+            progressBox, logBox, screen,
+            ok: false,
+            detail: `Batch ${encoded.failedBatch + 1} failed (exit code ${encoded.code})`,
+          });
         } else {
-          code = await runFFmpegInherit(videoOnlyArgs);
+          console.error(`Batch ${encoded.failedBatch + 1} failed (exit code ${encoded.code})`);
+          process.exit(encoded.code);
         }
-
-        if (code !== 0) {
-          if (useTui) {
-            progressBox.setContent(
-              `\n  {red-fg}{bold}Error:{/bold} Batch ${b + 1} failed (exit code ${code}){/red-fg}\n\n  Press {bold}q{/bold} to exit.`
-            );
-            screen.render();
-          } else {
-            console.error(`Batch ${b + 1} failed (exit code ${code})`);
-            process.exit(code);
-          }
-          return;
-        }
-        intermediates.push(batchOutput);
-        if (globalCtx) {
-          globalCtx.fileOffset += batch.length;
-          globalCtx.durationOffset += batchTotal;
-          globalCtx.currentBatch++;
-        }
-        log(`  Batch ${b + 1} complete.`);
+        return;
       }
     }
+    const intermediates = encoded.done;
 
     // Phase 2: Concat intermediates using concat demuxer (no re-encoding)
     log("");
@@ -1051,11 +1024,14 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
       const batchSumDurations = batches.map((_, b) =>
         batchDurations[b].reduce((a, c) => a + c, 0)
       );
-      concatCode = await runFFmpegTUI(
-        screen, logBox, progressBox, concatArgs,
-        intermediates, batchSumDurations, totalDuration,
-        globalCtx
-      );
+      concatCode = await runFFmpegTUI({
+        screen, logBox, progressBox,
+        ffmpegArgs: concatArgs,
+        files: intermediates,
+        durations: batchSumDurations,
+        totalDuration,
+        globalCtx,
+      });
     } else {
       concatCode = await runFFmpegInherit(concatArgs);
     }
@@ -1063,22 +1039,23 @@ async function processBatched({ validFiles, durations, width, height, fps, bgmPa
     const suffix = audioFailed ? " (video only)" : "";
     if (concatCode === 0) {
       if (useTui) {
-        progressBox.setContent(
-          `\n  {green-fg}{bold}Done!{/bold}{/green-fg} Output saved to ${outputFile}${suffix}\n\n  Press {bold}q{/bold} to exit.`
-        );
-        logBox.log("");
-        logBox.log("Finished successfully.");
-        screen.render();
+        showTuiOutcome({
+          progressBox, logBox, screen,
+          ok: true,
+          detail: `Output saved to ${outputFile}${suffix}`,
+          logMessage: "Finished successfully.",
+        });
       } else {
         console.log(`\nDone! Output saved to ${outputFile}${suffix}`);
       }
     } else {
       if (useTui) {
-        progressBox.setContent(
-          `\n  {red-fg}{bold}Error:{/bold} Concat failed (exit code ${concatCode}){/red-fg}\n\n  Press {bold}q{/bold} to exit.`
-        );
-        logBox.log(`Concat failed with code ${concatCode}`);
-        screen.render();
+        showTuiOutcome({
+          progressBox, logBox, screen,
+          ok: false,
+          detail: `Concat failed (exit code ${concatCode})`,
+          logMessage: `Concat failed with code ${concatCode}`,
+        });
       } else {
         console.error(`\nConcat failed (exit code ${concatCode})`);
         process.exit(concatCode);
@@ -1192,16 +1169,9 @@ async function run() {
   }
 
   // Build ffmpeg args
-  const { withAudioArgs, videoOnlyArgs } = buildFFmpegArgs(
-    validFiles,
-    width,
-    height,
-    fps,
-    bgmPath,
-    outputFile,
-    glitchSet,
-    preset
-  );
+  const { withAudioArgs, videoOnlyArgs } = buildFFmpegArgs({
+    files: validFiles, width, height, fps, bgmPath, outputFile, glitchSet, preset,
+  });
 
   // ── Legacy mode ──
   if (!useTui) {
@@ -1211,7 +1181,7 @@ async function run() {
     console.log(`\nTarget: ${width}x${height} @ ${fps.toFixed(2)} fps`);
     console.log(`Total duration: ${formatTime(totalDuration)}`);
     console.log("\nStitching videos...");
-    runLegacy(withAudioArgs, outputFile, videoOnlyArgs);
+    await runLegacy(withAudioArgs, outputFile, videoOnlyArgs);
     return;
   }
 
@@ -1236,24 +1206,22 @@ async function run() {
     logBox.log("");
   }
 
-  const code = await runFFmpegTUI(
-    screen,
-    logBox,
-    progressBox,
-    withAudioArgs,
-    validFiles,
+  const code = await runFFmpegTUI({
+    screen, logBox, progressBox,
+    ffmpegArgs: withAudioArgs,
+    files: validFiles,
     durations,
-    totalDuration
-  );
+    totalDuration,
+  });
 
   if (code === 0) {
     // Show completion in the UI
-    progressBox.setContent(
-      `\n  {green-fg}{bold}Done!{/bold}{/green-fg} Output saved to ${outputFile}\n\n  Press {bold}q{/bold} to exit.`
-    );
-    logBox.log("");
-    logBox.log("Finished successfully.");
-    screen.render();
+    showTuiOutcome({
+      progressBox, logBox, screen,
+      ok: true,
+      detail: `Output saved to ${outputFile}`,
+      logMessage: "Finished successfully.",
+    });
     // Wait for user to dismiss
     return;
   }
@@ -1263,30 +1231,29 @@ async function run() {
   logBox.log("{yellow-fg}Audio encoding failed. Retrying without audio...{/yellow-fg}");
   screen.render();
 
-  const code2 = await runFFmpegTUI(
-    screen,
-    logBox,
-    progressBox,
-    videoOnlyArgs,
-    validFiles,
+  const code2 = await runFFmpegTUI({
+    screen, logBox, progressBox,
+    ffmpegArgs: videoOnlyArgs,
+    files: validFiles,
     durations,
-    totalDuration
-  );
+    totalDuration,
+  });
 
   if (code2 === 0) {
-    progressBox.setContent(
-      `\n  {green-fg}{bold}Done!{/bold}{/green-fg} Output saved to ${outputFile} (video only)\n\n  Press {bold}q{/bold} to exit.`
-    );
-    logBox.log("");
-    logBox.log("Finished successfully (video only).");
+    showTuiOutcome({
+      progressBox, logBox, screen,
+      ok: true,
+      detail: `Output saved to ${outputFile} (video only)`,
+      logMessage: "Finished successfully (video only).",
+    });
   } else {
-    progressBox.setContent(
-      `\n  {red-fg}{bold}Error:{/bold} ffmpeg exited with code ${code2}{/red-fg}\n\n  Press {bold}q{/bold} to exit.`
-    );
-    logBox.log("");
-    logBox.log(`ffmpeg exited with code ${code2}`);
+    showTuiOutcome({
+      progressBox, logBox, screen,
+      ok: false,
+      detail: `ffmpeg exited with code ${code2}`,
+      logMessage: `ffmpeg exited with code ${code2}`,
+    });
   }
-  screen.render();
 }
 
 run().catch((err) => {
