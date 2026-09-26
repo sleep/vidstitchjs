@@ -92,14 +92,22 @@ function parseArgs(argv) {
         console.error("Error: --from requires an integer.");
         process.exit(1);
       }
-      fromIdx = parseInt(argv[i], 10);
+      fromIdx = Number(argv[i]);
+      if (!Number.isInteger(fromIdx)) {
+        console.error("Error: --from requires an integer.");
+        process.exit(1);
+      }
     } else if (argv[i] === "--to") {
       i++;
       if (i >= argv.length) {
         console.error("Error: --to requires an integer.");
         process.exit(1);
       }
-      toIdx = parseInt(argv[i], 10);
+      toIdx = Number(argv[i]);
+      if (!Number.isInteger(toIdx)) {
+        console.error("Error: --to requires an integer.");
+        process.exit(1);
+      }
     } else if (argv[i] === "--fat-mode") {
       fatMode = true;
     } else if (argv[i] === "--fast") {
