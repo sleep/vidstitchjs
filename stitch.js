@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { execSync, spawn } = require("child_process");
+const { execSync, execFileSync, spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -186,7 +186,35 @@ function getVideoInfo(filePath) {
 function getDuration(filePath) {
   try {
     const data = probe(filePath, ["-show_format"]);
-    return parseFloat(data.format?.duration) || 0;
+    const dur = parseFloat(data.format?.duration);
+    if (dur > 0) return dur;
+  } catch {
+    return 0;
+  }
+  // Recordings that were cut off (crash, disk full) never get the MKV
+  // duration header written. Fall back to the last video packet's timestamp.
+  return getDurationFromPackets(filePath);
+}
+
+function getDurationFromPackets(filePath) {
+  try {
+    const args = [
+      "-v", "quiet",
+      "-select_streams", "v:0",
+      "-show_entries", "packet=pts_time",
+      "-of", "csv=p=0",
+      filePath,
+    ];
+    const out = execFileSync("ffprobe", args, {
+      encoding: "utf-8",
+      maxBuffer: 256 * 1024 * 1024,
+    });
+    let max = 0;
+    for (const line of out.split("\n")) {
+      const t = parseFloat(line);
+      if (t > max) max = t;
+    }
+    return max;
   } catch {
     return 0;
   }
