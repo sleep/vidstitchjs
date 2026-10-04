@@ -22,6 +22,8 @@ node stitch.js <input-folder> [output-file] [options]
 
 The output defaults to `output.mp4` in the current directory.
 
+Supported formats: mp4, mkv, avi, mov, wmv, flv, webm, m4v, mpg, mpeg, ts, mts.
+
 ```
 node stitch.js ~/clips
 node stitch.js ~/clips montage.mp4 --bgm ~/music/song.mp3 --fast
@@ -36,12 +38,15 @@ node stitch.js ~/clips out.mp4 -r --from 20 --to 50
 | `--fast` | Use x264's `veryfast` preset. About 3x quicker, near-identical quality. |
 | `-r`, `--recursive` | Include clips in subdirectories. |
 | `--from <n>`, `--to <n>` | Only stitch files n through m (1-based, inclusive). |
-| `--glitch` | Scan for corrupted frames and stamp a "GLITCH" label on affected clips. |
-| `--fat-mode` | Keep temp files under 4GB for FAT32 drives. |
+| `--glitch` | Scan every file for corrupted frames first. Affected clips get a purple "GLITCH" label in the top-right corner. |
+| `--fat-mode` | Keep temp files under 4GB for FAT32 drives by batching on duration (about 15 min each) instead of file count. |
 | `--temp-dir <path>` | Where to put intermediate files (default: OS temp). |
-| `--no-delete-temp` | Keep intermediate files when done. |
-| `--no-tui` | Plain ffmpeg output instead of the progress UI. |
+| `--no-delete-temp` | Keep intermediate files when done. Handy for debugging. |
+| `--no-tui` | Plain ffmpeg output instead of the progress UI, for pipes and non-interactive shells. |
 
-Press `q` or Ctrl-C to quit mid-run. Unreadable files are skipped with a warning.
+## Notes
 
-More detail in [rtfm.md](rtfm.md).
+- Files that ffprobe can't read are skipped with a warning.
+- If audio encoding fails on any batch, the whole job is retried without audio rather than dying.
+- Jobs of 50+ files are processed in batches to stay under OS file descriptor limits, then concatenated at the end.
+- Press `q` or Ctrl-C in the progress UI to quit.
